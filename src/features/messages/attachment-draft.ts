@@ -8,6 +8,7 @@ import {
   type UploadProgress,
 } from "../relay/attachments";
 import { prepareAttachment } from "./prepare-attachment";
+import { clearView, readView, writeView } from "../../shared/view-state";
 
 export type DraftAttachment = Readonly<{
   id: string;
@@ -101,13 +102,45 @@ const MAX_RETAINED_BYTES = 2 * UPLOAD_MAX_BYTES;
 /** A refusal names this many files, then counts the rest. */
 const NAMED_REFUSALS = 3;
 
-/** Tab-local files survive navigation, not reload. Delivery remains outbox-owned.
- * A new chat's draft uploads before its channel exists. */
+/** A composer's view scope and key for its uploaded files. */
+type SavedFiles = readonly [scope: string, key: string];
+
+const uploadedItem = (attachment: UploadedAttachment): DraftAttachment => ({
+  id: crypto.randomUUID(),
+  file: new File([], attachment.name, { type: attachment.type }),
+  status: "ready",
+  uploaded: attachment,
+  ...(attachment.voice ? { voice: attachment.voice } : {}),
+});
+
+function restoreFiles([scope, key]: SavedFiles) {
+  const saved: unknown = readView(scope, key, []);
+  return (Array.isArray(saved) ? saved : [])
+    .filter(
+      (file): file is UploadedAttachment =>
+        typeof file?.url === "string" &&
+        typeof file.name === "string" &&
+        typeof file.type === "string" &&
+        typeof file.sha256 === "string" &&
+        Number.isFinite(file.size) &&
+        (file.voice === undefined ||
+          (Number.isFinite(file.voice?.duration) &&
+            Array.isArray(file.voice.waveform) &&
+            file.voice.waveform.every(Number.isFinite))),
+    )
+    .slice(0, MAX_ATTACHMENT_FILES)
+    .map(uploadedItem);
+}
+
+/** Tab-local files survive navigation. With `saved`, uploaded files also
+ * survive reload; local bytes still upload in this tab only. Delivery remains
+ * outbox-owned. A new chat's draft uploads before its channel exists. */
 export function attachmentDraft(
   session: ComposerSession,
   key: string,
   channelId: string,
   newChat = false,
+  saved?: SavedFiles,
 ): AttachmentDraft {
   let partition = drafts.get(session);
   if (!partition) {
@@ -117,14 +150,31 @@ export function attachmentDraft(
   const existing = partition.get(key);
   if (existing) return existing;
   const owners = partition;
-  let items: readonly DraftAttachment[] = [];
+  let items: readonly DraftAttachment[] = saved ? restoreFiles(saved) : [];
   const listeners = new Set<() => void>();
   let paused = false;
   let active = new Map<string, UploadTask>();
   let pending = new Map<string, Promise<UploadedAttachment>>();
+  const uploadedFiles = () =>
+    items.flatMap((item) => (item.uploaded ? [item.uploaded] : []));
+  // Save only this store's changes, so a stale window cannot rewrite a clear.
+  let savedFiles = JSON.stringify(uploadedFiles());
+  const save = ([scope, key]: SavedFiles) => {
+    const files = uploadedFiles();
+    const revision = JSON.stringify(files);
+    if (revision === savedFiles) return;
+    savedFiles = revision;
+    try {
+      if (files.length) writeView(scope, key, files);
+      else clearView(scope, key);
+    } catch {
+      /* Storage unavailable; the files remain in this tab. */
+    }
+  };
   let count = 0;
   const emit = () => {
     for (const listener of listeners) listener();
+    if (saved) save(saved);
     if (items.length === count) return;
     count = items.length;
     for (const listener of countListeners.get(session) ?? []) listener();
@@ -375,15 +425,7 @@ export function attachmentDraft(
           `Attach at most ${MAX_ATTACHMENT_FILES} files per message.`,
         );
       // No local bytes are retained. Send reuses the already uploaded descriptor.
-      items = [
-        ...items,
-        {
-          id: crypto.randomUUID(),
-          file: new File([], attachment.name, { type: attachment.type }),
-          status: "ready",
-          uploaded: attachment,
-        },
-      ];
+      items = [...items, uploadedItem(attachment)];
       owners.set(key, store);
       emit();
     },
@@ -486,10 +528,11 @@ export function useAttachmentDraft(
   key: string,
   channelId: string,
   newChat = false,
+  saved?: SavedFiles,
 ) {
   // Composer's destination key remounts this hook on a session/channel/thread change.
   const [store] = useState(() =>
-    attachmentDraft(session, key, channelId, newChat),
+    attachmentDraft(session, key, channelId, newChat, saved),
   );
   const items = useSyncExternalStore(
     store.subscribe,
